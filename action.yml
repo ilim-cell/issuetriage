@@ -1,0 +1,358 @@
+name: 'Issue Triage'
+description: 'Automate issue tracking from PR merges to release confirmation and auto-closing.'
+author: 'ilim-cell'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  github-token:
+    description: 'GitHub Token with write permissions for issues and pull-requests.'
+    required: true
+    default: ${{ github.token }}
+
+  # --- Closing Keyword Warning Strategy ---
+  keyword-action:
+    description: 'Action when closing keywords are found: "reopen", "reopen except maintainer", "warn", or "ignore".'
+    required: true
+    default: 'warn'
+
+  # --- Custom Labels ---
+  pending-label:
+    description: 'Label applied when a PR referencing an issue merges to main.'
+    required: true
+    default: 'fixed (pending release)'
+  pending-label-color:
+    description: 'Color hex code for the pending label.'
+    required: true
+    default: '0e8a16'
+
+  confirm-label:
+    description: 'Label applied when a release is published or applied manually by maintainers.'
+    required: true
+    default: 'please confirm close'
+  confirm-label-color:
+    description: 'Color hex code for the confirm label.'
+    required: true
+    default: '048c23'
+
+  half-label:
+    description: 'Label applied to issues where only part of the problem was resolved.'
+    required: true
+    default: 'half'
+
+  skip-labels:
+    description: 'JSON array string of labels that this action must ignore (e.g. ["summary", "epic"]).'
+    required: true
+    default: '["summary"]'
+
+  # --- Timers ---
+  confirm-days:
+    description: 'Number of days to wait for a reporter reply before closing.'
+    required: true
+    default: '14'
+
+  # --- Custom Regex Patterns ---
+  ref-regex:
+    description: 'Regex pattern used to find issue references in PR descriptions.'
+    required: true
+    default: '(refs?|references?|related to|fixes|fixed|closes?|resolves?)[[:space:]]*:?[[:space:]]*#[0-9]+'
+
+  closing-keyword-regex:
+    description: 'Regex pattern used to warn against keywords that immediately close issues on merge.'
+    required: true
+    default: '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#[0-9]+'
+
+  # --- Custom Comment Templates ---
+  template-pending-comment:
+    description: 'Comment template posted to issue when fixed on main. Supports {PR_NUMBER}, {CONFIRM_DAYS}.'
+    required: true
+    default: |
+      A fix for this was added in #{PR_NUMBER} and will be included in a future release.
+
+      Nothing has changed on your setup yet. When the release is available, you will get a comment on this issue with the version to install. After that, you will have {CONFIRM_DAYS} days to let us know if it solved the problem.
+
+  template-keyword-warning:
+    description: 'Comment template posted to PR when closing keywords are used.'
+    required: true
+    default: |
+      This pull request uses a keyword that closes the referenced issue immediately on merge, before the fix is available in a release.
+
+      Please use plain reference syntax (e.g. `Refs #123`) instead so the reporter is notified when the release goes out.
+
+      *React with 👍 on this PR comment to auto-reopen any closed issues if merged.*
+
+  template-release-comment:
+    description: 'Comment template posted when a release goes out. Supports {VERSION}, {LOGIN}, {TAG}, {CONFIRM_DAYS}.'
+    required: true
+    default: |
+      The fix for this is out now, in **{VERSION}**.
+
+      @{LOGIN}, could you update to that version and say whether it fixed things? If no response arrives in {CONFIRM_DAYS} days, this issue will be closed automatically.
+
+  template-half-release-comment:
+    description: 'Comment template posted when a release goes out for a "half" issue. Supports {VERSION}, {LOGIN}, {TAG}, {CONFIRM_DAYS}.'
+    required: true
+    default: |
+      Part of what you reported is fixed, and that part is out now in **{VERSION}**.
+
+      @{LOGIN}, the rest of this issue remains open. Could you update and let us know if the landed fix solves your main issue? If no response arrives in {CONFIRM_DAYS} days, this issue will be closed.
+
+  template-closing-comment:
+    description: 'Comment template posted when closing an issue due to inactivity. Supports {VERSION}, {CONFIRM_DAYS}.'
+    required: true
+    default: |
+      No response received in {CONFIRM_DAYS} days, so this issue is being closed as resolved.
+
+      If **{VERSION}** did not fix the issue, leave a comment here to reopen it at any time.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Execute Issue Fix Status Workflow
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        KEYWORD_ACTION: ${{ inputs.keyword-action }}
+        PENDING_LABEL: ${{ inputs.pending-label }}
+        PENDING_COLOR: ${{ inputs.pending-label-color }}
+        CONFIRM_LABEL: ${{ inputs.confirm-label }}
+        CONFIRM_COLOR: ${{ inputs.confirm-label-color }}
+        HALF_LABEL: ${{ inputs.half-label }}
+        SKIP_LABELS: ${{ inputs.skip-labels }}
+        CONFIRM_DAYS: ${{ inputs.confirm-days }}
+        REF_REGEX: ${{ inputs.ref-regex }}
+        CLOSING_REGEX: ${{ inputs.closing-keyword-regex }}
+        TPL_PENDING: ${{ inputs.template-pending-comment }}
+        TPL_WARN: ${{ inputs.template-keyword-warning }}
+        TPL_RELEASE: ${{ inputs.template-release-comment }}
+        TPL_HALF: ${{ inputs.template-half-release-comment }}
+        TPL_CLOSE: ${{ inputs.template-closing-comment }}
+      run: |
+        set -euo pipefail
+
+        # --- Safe Input Diagnostics & Fallbacks ---
+        GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+        KEYWORD_ACTION="${KEYWORD_ACTION:-warn}"
+        PENDING_LABEL="${PENDING_LABEL:-fixed (pending release)}"
+        PENDING_COLOR="${PENDING_COLOR:-0e8a16}"
+        CONFIRM_LABEL="${CONFIRM_LABEL:-please confirm close}"
+        CONFIRM_COLOR="${CONFIRM_COLOR:-048c23}"
+        HALF_LABEL="${HALF_LABEL:-half}"
+        SKIP_LABELS="${SKIP_LABELS:-[\"summary\"]}"
+        CONFIRM_DAYS="${CONFIRM_DAYS:-14}"
+        REF_REGEX="${REF_REGEX:-(refs?|references?|related to|fixes|fixed|closes?|resolves?)[[:space:]]*:?[[:space:]]*#[0-9]+}"
+        CLOSING_REGEX="${CLOSING_REGEX:-(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#[0-9]+}"
+
+        if [ -z "$GH_TOKEN" ]; then
+          echo "Warning: GH_TOKEN missing. Action cannot interact with GitHub API. Skipping evaluation."
+          exit 0
+        fi
+
+        ensure_label_exists() {
+          local name="$1"
+          local color="$2"
+          local desc="$3"
+          if ! gh label view "$name" >/dev/null 2>&1; then
+            echo "Creating label '$name'..."
+            gh label create "$name" --color "$color" --description "$desc" || true
+          fi
+        }
+
+        EVENT_NAME="${{ github.event_name }}"
+        PR_ACTION="${{ github.event.action }}"
+        PR_MERGED="${{ github.event.pull_request.merged }}"
+        PR_USER_TYPE="${{ github.event.pull_request.user.type }}"
+        PR_AUTHOR_ASSOCIATION="${{ github.event.pull_request.author_association }}"
+        WF_CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+
+        # --- MODE 1: Fixed on Main (PR Merged) & Keyword Reopen Handler ---
+        if [ "$EVENT_NAME" = "pull_request_target" ] \vert{}\vert{} [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+            echo "==> Running Fixed-on-Main phase"
+            ensure_label_exists "$PENDING_LABEL" "$PENDING_COLOR" "Fix merged to main, waiting for release"
+
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+
+            gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.body // ""' > pr-body.txt
+
+            # Evaluate keyword handling if closing keywords were used
+            closing_refs=$(grep -oiE "$CLOSING_REGEX" pr-body.txt \vert{} grep -oE '[0-9]+$' | sort -un) || true
+            if [ -n "$closing_refs" ] && [ "$KEYWORD_ACTION" != "ignore" ]; then
+              
+              is_maintainer=false
+              if [[ "$PR_AUTHOR_ASSOCIATION" =~ ^(OWNER\vert{}MEMBER\vert{}COLLABORATOR)$ ]]; then
+                is_maintainer=true
+              fi
+
+              should_reopen=false
+
+              case "$KEYWORD_ACTION" in
+                "reopen")
+                  should_reopen=true
+                  ;;
+                "reopen except maintainer")
+                  if [ "$is_maintainer" = false ]; then
+                    should_reopen=true
+                  fi
+                  ;;
+                "warn")
+                  # Check if maintainers/reporters reacted with +1 to the warning comment
+                  warning_comment=$(gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" --jq '.[] | select(.body | contains("vorssaint-fix-status hint=closing")) | .id' | tail -n 1)
+                  if [ -n "$warning_comment" ]; then
+                    thumbs_up=$(gh api "repos/$GH_REPO/issues/comments/$warning_comment/reactions" --jq '[.[] | select(.content == "+1")] | length')
+                    if [ "$thumbs_up" -gt 0 ]; then
+                      should_reopen=true
+                    fi
+                  fi
+                  ;;
+              esac
+
+              if [ "$should_reopen" = true ]; then
+                for c_num in $closing_refs; do
+                  echo "Reopening issue #$c_num per keyword-action configuration ($KEYWORD_ACTION)..."
+                  gh issue reopen "$c_num" || true
+                done
+              fi
+            fi
+
+            # Label referenced issues with Pending
+            refs=$(grep -oiE "$REF_REGEX" pr-body.txt \vert{} grep -oE '[0-9]+$' | sort -un) || true
+            if [ -z "$refs" ]; then
+              echo "#$PR_NUMBER references no issue, exiting."
+              exit 0
+            fi
+
+            for number in $refs; do
+              issue=$(gh api "repos/$GH_REPO/issues/$number" 2>/dev/null) || continue
+              [ "$(jq 'has("pull_request")' <<<"$issue")" = false ] || continue
+
+              skip=$(jq -r --argjson skip "$SKIP_LABELS" 'first(.labels[].name | select(IN($skip[]))) // empty' <<<"$issue")
+              [ -z "$skip" ] || continue
+
+              gh api "repos/$GH_REPO/issues/$number/labels" -f "labels[]=$PENDING_LABEL" --silent
+
+              if jq -e --arg l "$CONFIRM_LABEL" 'any(.labels[]; .name == $l)' <<<"$issue" >/dev/null; then
+                gh issue edit "$number" --remove-label "$CONFIRM_LABEL" || true
+              fi
+
+              body=$(sed "s/{PR_NUMBER}/$PR_NUMBER/g; s/{CONFIRM_DAYS}/$CONFIRM_DAYS/g" <<<"$TPL_PENDING")
+              body="$body"$'\n\n'<!-- vorssaint-fix-status sha=$MERGE_SHA pr=$PR_NUMBER -->
+
+              gh issue comment "$number" --body "$body"
+              echo "#$number: labeled$PENDING_LABEL"
+            done
+            exit 0
+          fi
+        fi
+
+        # --- MODE 2: Closing Keyword Warning Phase ---
+        if [ "$EVENT_NAME" = "pull_request_target" ] \vert{}\vert{} [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$PR_ACTION" != "closed" ] && [ "$PR_USER_TYPE" != "Bot" ] && [ "$KEYWORD_ACTION" != "ignore" ]; then
+            echo "==> Running Closing-Keyword Warning phase"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+
+            gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.body // ""' > pr-body.txt
+            closing=$(grep -oiE "$CLOSING_REGEX" pr-body.txt \vert{} grep -oE '[0-9]+$' | sort -un) || true
+
+            if [ -n "$closing" ]; then
+              if ! gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" --jq '.[].body' | grep -q "vorssaint-fix-status hint="; then
+                body="$TPL_WARN"$'\n\n'<!-- vorssaint-fix-status hint=closing -->
+                gh pr comment "$PR_NUMBER" --body "$body"
+                echo "#$PR_NUMBER: warning posted"
+              fi
+            fi
+            exit 0
+          fi
+        fi
+
+        # --- MODE 3: Reporter Release Sweep ---
+        if [ "$EVENT_NAME" = "workflow_run" ] && [ "$WF_CONCLUSION" = "success" ]; then
+          echo "==> Running Reporter Release Check phase"
+          TAG="${{ github.event.workflow_run.head_branch }}"
+
+          if ! grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$TAG"; then
+            echo "Tag '$TAG' is not a stable release tag. Skipping."
+            exit 0
+          fi
+
+          ensure_label_exists "$CONFIRM_LABEL" "$CONFIRM_COLOR" "Fix released, awaiting reporter verification"
+          version=${TAG#v}
+
+          gh issue list --state open --label "$PENDING_LABEL" --limit 500 --json number,author,labels \
+            | jq -r --argjson skip "$SKIP_LABELS" --arg half "$HALF_LABEL" \
+                '.[] | select(any(.labels[].name; IN($skip[])) | not) | "\(.number) \(.author.login) \(any(.labels[].name; . == $half))"' \
+            > pending.txt
+
+          while read -r number login half; do
+            [ -n "$number" ] || continue
+
+            gh api "repos/$GH_REPO/issues/$number/labels" -f "labels[]=$CONFIRM_LABEL" --silent
+            gh issue edit "$number" --remove-label "$PENDING_LABEL" || true
+
+            if [ "$half" = true ]; then
+              tpl="$TPL_HALF"
+            else
+              tpl="$TPL_RELEASE"
+            fi
+
+            body=$(sed "s/{VERSION}/$version/g; s/{LOGIN}/$login/g; s/{TAG}/$TAG/g; s/{CONFIRM_DAYS}/$CONFIRM_DAYS/g" <<<"$tpl")
+            body="$body"$'\n\n'<!-- vorssaint-fix-status confirm=$TAG -->
+
+            gh issue comment "$number" --body "$body"
+            echo "#$number: moved to $CONFIRM_LABEL for release$TAG"
+          done < pending.txt
+          exit 0
+        fi
+
+        # --- MODE 4: Schedule / Auto-Close Unanswered ---
+        if [ "$EVENT_NAME" = "schedule" ] \vert{}\vert{} [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          echo "==> Running Auto-Close Unanswered phase"
+          ensure_label_exists "$CONFIRM_LABEL" "$CONFIRM_COLOR" "Fix released, awaiting reporter verification"
+
+          cutoff=$(date -u -d "$CONFIRM_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+
+          gh issue list --state open --label "$CONFIRM_LABEL" --limit 500 --json number,author,labels \
+            | jq -r --argjson skip "$SKIP_LABELS" '.[] \vert{} select(any(.labels[].name; IN($skip[])) | not) | "\(.number) \(.author.login)"' \
+            > waiting.txt
+
+          while read -r number login; do
+            [ -n "$number" ] || continue
+
+            comments=$(gh api --paginate "repos/$GH_REPO/issues/$number/comments" --jq '[.[] | {created_at, login: .user.login, body}]' | jq -s add)
+            ask=$(jq -c '[.[] \vert{} select(.body \vert{} test("vorssaint-fix-status confirm="))] \vert{} last' <<<"$comments")
+
+            if [ "$ask" = null ]; then
+              TAG=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+              [ -n "$TAG" ] || continue
+              version=${TAG#v}
+
+              body=$(sed "s/{VERSION}/$version/g; s/{LOGIN}/$login/g; s/{TAG}/$TAG/g; s/{CONFIRM_DAYS}/$CONFIRM_DAYS/g" <<<"$TPL_RELEASE")
+              body="$body"$'\n\n'<!-- vorssaint-fix-status confirm=$TAG -->
+
+              gh issue comment "$number" --body "$body"
+              continue
+            fi
+
+            asked=$(jq -r '.created_at' <<<"$ask")
+            version=$(jq -r '.body \vert{} capture("confirm=(?<v>v[0-9]+\\.[0-9]+\\.[0-9]+)") \vert{} .v' <<<"$ask")
+
+            if [[ "$asked" > "$cutoff" ]]; then
+              continue
+            fi
+
+            replies=$(jq --arg t "$asked" '[.[] | select(.created_at > $t) \vert{} select(.login != "github-actions[bot]")] \vert{} length' <<<"$comments")
+            if [ "$replies" -gt 0 ]; then
+              continue
+            fi
+
+            body=$(sed "s/{VERSION}/$version/g; s/{CONFIRM_DAYS}/$CONFIRM_DAYS/g" <<<"$TPL_CLOSE")
+            gh issue comment "$number" --body "$body"
+            gh issue close "$number" --reason completed
+            gh issue edit "$number" --remove-label "$CONFIRM_LABEL" || true
+            echo "#$number: auto-closed due to inactivity"
+          done < waiting.txt
+          exit 0
+        fi
