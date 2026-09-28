@@ -1,4 +1,4 @@
-name: 'Issue Triage'
+name: 'Issue Triager'
 description: 'Automate issue tracking from PR merges to release confirmation and auto-closing.'
 author: 'ilim-cell'
 branding:
